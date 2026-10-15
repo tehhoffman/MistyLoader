@@ -1,0 +1,36 @@
+{
+  "version": "0.1.0",
+  "verified_date": "2026-10-15",
+  "upstream_revision": "b76b13379d3b7d67ab0bc424516bb6fd2522bd8e",
+  "patch_sha256": "32e8c219db918c68d42c518eeda49e9c68855cd64e862ad334b0db72f86fae40",
+  "build": {
+    "fresh_upstream_fetch": true,
+    "changed_source_hashes_match_checkpoint": true,
+    "cuda_architecture": "86",
+    "nvtx": false,
+    "targets": [
+      "llama-server",
+      "test-mistral-moe-cpu",
+      "test-backend-ops"
+    ]
+  },
+  "checks": {
+    "cpu_bitwise_comparisons": 200,
+    "cpu_cuda_full_expert_cases": 12,
+    "python_syntax": "passed",
+    "shell_syntax": "passed",
+    "bootstrap_idempotency": "passed",
+    "scale_fetch_matches_original_repair": true,
+    "repair_rejects_wrong_source_checksum": true
+  },
+  "launcher": {
+    "alias": "mistyloader",
+    "capital_of_france_response": "Paris",
+    "decode_threads": 12,
+    "prefill_threads": 16,
+    "mode": "concurrent",
+    "inherited_serial_control_cleared": true,
+    "graceful_shutdown": true
+  },
+  "scope": "Packaging validation of the same runtime source as checkpoint.json. Performance figures remain the earlier checkpoint measurements; this was not a new throughput benchmark. The full 72 GB repair was not rerun for packaging."
+}

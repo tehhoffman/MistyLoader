@@ -1,0 +1,15 @@
+/vendor/
+/build/
+/models/
+/artifacts/
+/dist/
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+*.log
+.env
+.env.*
+.venv/
+*.md
+!/README.md

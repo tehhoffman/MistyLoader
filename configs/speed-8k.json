@@ -1,0 +1,25 @@
+{
+  "profile": "experimental-speed-8k",
+  "context": 8192,
+  "cache_mib": 16384,
+  "cpu_threads": 12,
+  "batch_threads": 16,
+  "microbatch": 256,
+  "kv": "q8_0",
+  "speculation": "none",
+  "environment": {
+    "GGML_CUDA_REGISTER_HOST": "1",
+    "MISTRAL_CUDA_F32_DOWN": "1",
+    "MISTRAL_CACHE_HYBRID": "1",
+    "MISTRAL_CACHE_WARM_STEPS": "64",
+    "MISTRAL_CACHE_POLICY": "lfu",
+    "MISTRAL_CACHE_REFRESH_STEPS": "4",
+    "MISTRAL_CACHE_WHOLE_FFN": "1",
+    "MISTRAL_CPU_SKIP_MASKED": "1",
+    "MISTRAL_CACHE_MAX_TOKENS": "1",
+    "MISTRAL_CPU_CONCURRENT": "1"
+  },
+  "alias": "mistyloader",
+  "tested_model_sha256": "35d2240fcd50316bae8501c9b38d9cc6c60058f0b29e1c8af0e93c3ebc7743f0",
+  "scope": "Linux, 2x RTX 3060 12GB, 5950X, 128GB RAM; single-user short-history decode. See README for limits."
+}

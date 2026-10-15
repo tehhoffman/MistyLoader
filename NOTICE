@@ -1,0 +1,28 @@
+MistyLoader
+Copyright (c) 2026 Robert Hoffman
+
+MistyLoader is an AI-assisted experimental extension of llama.cpp and ggml.
+The runtime is distributed as a patch against the exact upstream revision in
+upstream.lock.json. Upstream copyright and MIT license terms are retained in
+LICENSE and licenses/llama.cpp.txt. The bootstrap script fetches the upstream
+source, including its original third-party notices.
+
+Strata, by Niko1221 and the Strata contributors, inspired the hybrid expert
+cache and concurrent CPU/GPU execution work. Strata was studied as a reference;
+its installed runtime and model files are not included in this distribution.
+Its MIT attribution is retained in licenses/Strata.txt.
+Reference: https://github.com/attentiondotnet/Strata
+Inspected revision: a0116b2782a5b82622358c04a06496485d12b2d6
+
+Mistral AI created Mistral Small 4. The tested community GGUF was published by
+timteh673. Exact model provenance and checksums are in configs/model-provenance.json.
+Model weights, model-derived scale data, and CUDA runtime binaries are not
+included in this source distribution. Models retain their own license terms.
+
+Red Hat AI's Mistral Small 4 DFlash draft informed the deferred speculative
+decoding experiment. No draft weights are included and speculation is disabled
+in the released speed profile.
+
+OpenAI Codex assisted with implementation, debugging, testing, documentation,
+and benchmarking. This project is independent of the organizations credited
+above; their inclusion does not imply endorsement.

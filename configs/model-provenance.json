@@ -1,0 +1,11 @@
+{
+  "tested_filename": "mistral-small-4-uncensored-scale-repaired-Q4_K_M.gguf",
+  "tested_sha256": "35d2240fcd50316bae8501c9b38d9cc6c60058f0b29e1c8af0e93c3ebc7743f0",
+  "source_repository": "timteh673/Mistral-Small-4-119B-Uncensored-GGUF",
+  "source_revision": "bff209356d49488f38289978977044baa2167730",
+  "source_filename": "Mistral-Small-4-119B-Uncensored-Q4_K_M.gguf",
+  "source_sha256": "c8455ca33799c5460d21be23f70193ed826a6ec1fb0fe8229b29898755b079bd",
+  "official_repository": "mistralai/Mistral-Small-4-119B-2603",
+  "official_revision": "a11f36bebf709121056b1dbcc943d1c6afbe494d",
+  "repair_status": "Experimental rescaling of Q4_K d/dmin and Q6_K d fields; not equivalent to a fresh conversion."
+}

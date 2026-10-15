@@ -1,0 +1,1341 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index ab82e3d..48333fa 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1581,6 +1581,25 @@ static void ggml_compute_forward_mul_mat_id(
+     GGML_ASSERT(nb1 <= nb2);
+     GGML_ASSERT(nb2 <= nb3);
+ 
++    if (ggml_get_op_params_i32(dst, 4) == 1 && getenv("MISTRAL_CPU_SKIP_MASKED")) {
++        bool all_masked = true;
++        for (int64_t row = 0; row < ids->ne[1] && all_masked; ++row) {
++            for (int64_t col = 0; col < ids->ne[0]; ++col) {
++                const int32_t id = *(const int32_t *) ((const char *) ids->data + row*ids->nb[1] + col*ids->nb[0]);
++                if (id != -1) {
++                    all_masked = false;
++                    break;
++                }
++            }
++        }
++        if (all_masked) {
++            for (int64_t row = ith; row < ne1*ne2; row += nth) {
++                memset((char *) dst->data + (row % ne1)*nb1 + (row / ne1)*nb2, 0, ne0*sizeof(float));
++            }
++            return;
++        }
++    }
++
+     // row groups
+     const int n_ids = ids->ne[0]; // n_expert_used
+     const int n_as  = ne02;       // n_expert
+@@ -1652,6 +1671,10 @@ static void ggml_compute_forward_mul_mat_id(
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
++                if (i02 == -1 && ggml_get_op_params_i32(dst, 4) == 1) {
++                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
++                    continue;
++                }
+                 assert(i02 >= 0 && i02 < n_as);
+ 
+                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7c45d0d..4304c94 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -33,6 +33,7 @@
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
++#include "ggml-cuda/mmvq-f32.cuh"
+ #include "ggml-cuda/moe-weighted-reduction.cuh"
+ #include "ggml-cuda/norm.cuh"
+ #include "ggml-cuda/opt-step-adamw.cuh"
+@@ -1867,6 +1868,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+ }
+ 
+ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
++    if (ggml_get_op_params_i32(tensor, 3) == GGML_PREC_F32 || ggml_get_op_params_i32(tensor, 4) == 1) {
++        return false;
++    }
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -2005,6 +2009,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+ // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
+ // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
++    if (ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32 && ggml_cuda_supports_mmq_f32_input(dst)) {
++        return false;
++    }
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
+@@ -2034,6 +2041,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+ }
+ 
+ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32) {
++        ggml_cuda_mul_mat_id_f32(ctx, dst);
++        return;
++    }
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+     const ggml_tensor * ids  = dst->src[2];
+@@ -5493,7 +5504,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     return false;
+                 }
+                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+-                    return false;
++                    return (getenv("MISTRAL_CUDA_F32_DOWN") || getenv("MISTRAL_CACHE_HYBRID")) &&
++                        ggml_cuda_supports_mmq_f32_input(op);
+                 }
+ #ifdef GGML_USE_MUSA
+                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 8068ba3..80b6b4d 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -642,6 +642,16 @@ static __global__ void mul_mat_vec_q(
+     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
+     sample_dst = blockIdx.z;
+ 
++    // Private hybrid cache: a missing single-token expert contributes zero.
++    if constexpr (ncols_dst == 1 && !has_fusion) {
++        if (ids && channel_x == uint32_t(-1)) {
++            if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block && uint32_t(row0 + threadIdx.x) < stride_col_dst) {
++                dst[sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0 + threadIdx.x] = 0.0f;
++            }
++            return;
++        }
++    }
++
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+     const uint32_t sample_y    = sample_dst;
+ 
+@@ -920,6 +930,16 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
+     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+ 
++    if constexpr (!has_fusion) {
++        if (channel_x == uint32_t(-1)) {
++            if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
++                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
++            }
++            ggml_cuda_pdl_lc();
++            return;
++        }
++    }
++
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+ 
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97250c2..bb915d4 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -29,6 +29,7 @@ set(LLAMA_CORE_SOURCES
+     llama-kv-cache-dsv4.cpp
+     llama-memory.cpp
+     llama-moe-cache.cpp
++    llama-moe-cpu.cpp
+     llama-memory-hybrid.cpp
+     llama-memory-hybrid-iswa.cpp
+     llama-memory-hybrid-idx.cpp
+@@ -71,6 +72,14 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
+ 
++option(MISTRAL_MOE_NVTX "Trace the private Mistral CPU executor with NVTX" OFF)
++if (MISTRAL_MOE_NVTX)
++    find_path(MISTRAL_NVTX_INCLUDE nvtx3/nvToolsExt.h HINTS /usr/local/cuda/include REQUIRED)
++    target_include_directories(llama PRIVATE ${MISTRAL_NVTX_INCLUDE})
++    target_compile_definitions(llama PRIVATE MISTRAL_MOE_NVTX)
++    target_link_libraries(llama PRIVATE ${CMAKE_DL_LIBS})
++endif()
++
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..b3a4ff7 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -549,7 +549,7 @@ llama_context::llama_context(
+         }
+ 
+         if (cparams.moe_cache_size > 0) {
+-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
++            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.n_threads);
+         }
+ 
+         sched_reserve();
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6cadda9..8d827cb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-impl.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
++#include "llama-moe-cpu.h"
+ #include "llama-batch.h"
+ #include "llama-cparams.h"
+ #include "llama-sampler.h"
+@@ -19,6 +20,7 @@
+ 
+ #include <cassert>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <numeric>
+ #include <sstream>
+@@ -1652,6 +1654,25 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+     return res;
+ }
+ 
++static ggml_tensor * mistral_masked_mm_id(ggml_context * ctx, ggml_tensor * w, ggml_tensor * a, ggml_tensor * ids) {
++    ggml_tensor * result = ggml_mul_mat_id(ctx, w, a, ids);
++    // Private CPU/CUDA convention: -1 expert IDs produce zero columns.
++    result->op_params[4] = 1;
++    ggml_prec_set_src(result, GGML_PREC_F32, 1);
++    return result;
++}
++
++static void mistral_cpu_miss_ids(ggml_tensor * dst, const ggml_tensor * ids, const ggml_tensor * slots,
++                                int ith, int nth, void *) {
++    for (int64_t row = ith; row < ids->ne[1]; row += nth) {
++        for (int64_t col = 0; col < ids->ne[0]; ++col) {
++            const int32_t id = *reinterpret_cast<const int32_t *>((const char *) ids->data + row*ids->nb[1] + col*ids->nb[0]);
++            const int32_t slot = *reinterpret_cast<const int32_t *>((const char *) slots->data + row*slots->nb[1] + col*slots->nb[0]);
++            *reinterpret_cast<int32_t *>((char *) dst->data + row*dst->nb[1] + col*dst->nb[0]) = slot < 0 ? id : -1;
++        }
++    }
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w,   // ggml_tensor * as
+           ggml_tensor * cur, // ggml_tensor * b
+@@ -1664,6 +1685,18 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+         ggml_mul_mat_id(ctx0, w, cur, ids) :
+         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+ 
++    if (slots && arch == LLM_ARCH_MISTRAL4 && std::getenv("MISTRAL_CACHE_HYBRID")) {
++        ggml_tensor * miss_ids = ggml_map_custom2(ctx0, ids, slots, mistral_cpu_miss_ids, 1, nullptr);
++        ggml_tensor * cpu = mistral_masked_mm_id(ctx0, w, cur, miss_ids);
++        ggml_backend_sched_set_tensor_backend(sched, cpu, backend_cpu);
++        ggml_tensor * gpu = mistral_masked_mm_id(ctx0, moe_cache->get_experts(w), cur, slots);
++        const bool quant_batch = cur->ne[2] <= 8 && std::getenv("MISTRAL_CACHE_QUANT_BATCH");
++        if ((cur->ne[2] == 1 || quant_batch) && std::strstr(w->name, "ffn_down_exps.") == nullptr) {
++            ggml_prec_set_src(gpu, GGML_PREC_DEFAULT, 1);
++        }
++        res = ggml_add(ctx0, gpu, cpu);
++    }
++
+     if (prec_policy) {
+         prec_policy->apply(res);
+     }
+@@ -2287,6 +2320,74 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+ 
++    const auto supported_quant = [](const ggml_tensor * w) {
++        return w && (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K);
++    };
++    if (arch == LLM_ARCH_MISTRAL4 && slots && n_tokens == 1 &&
++        std::getenv("MISTRAL_CACHE_WHOLE_FFN") && std::getenv("MISTRAL_CACHE_HYBRID") &&
++        std::getenv("MISTRAL_CUDA_F32_DOWN") && type_op == LLM_FFN_SILU && !weight_before_ffn &&
++        supported_quant(gate_up_exps) && supported_quant(down_exps) &&
++        !gate_up_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
++        loras->empty() && (!prec_policy || (prec_policy->prec_src1.empty() && prec_policy->prec_acc.empty())) && !hdmd) {
++        if (il == 0) {
++            LLAMA_LOG_INFO("mistral: whole-expert CPU/GPU branches enabled for single-token decode\n");
++        }
++        // Keep each branch local through SwiGLU and down projection. Merge only the final outputs.
++        const auto branch = [&](ggml_tensor * gu_w, ggml_tensor * down_w, ggml_tensor * ids, bool cpu) {
++            ggml_tensor * gu = mistral_masked_mm_id(ctx0, gu_w, cur, ids);
++            if (!cpu) {
++                ggml_prec_set_src(gu, GGML_PREC_DEFAULT, 1);
++                if (moe_cache->cpu_executor()) {
++                    gu->op_params[5] = llama_moe_cpu::graph_tag;
++                }
++            }
++            const int64_t n_ff = gu->ne[0] / 2;
++            ggml_tensor * gate = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], 1, gu->nb[1], gu->nb[2], 0);
++            ggml_tensor * up = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], 1, gu->nb[1], gu->nb[2], n_ff*gu->nb[0]);
++            ggml_tensor * act = ggml_swiglu_split(ctx0, gate, up);
++            ggml_tensor * down = mistral_masked_mm_id(ctx0, down_w, act, ids);
++            ggml_backend_t backend = cpu ? backend_cpu : moe_cache->backend(il);
++            for (ggml_tensor * t : { gu, gate, up, act, down }) {
++                ggml_backend_sched_set_tensor_backend(sched, t, backend);
++            }
++            cb(down, cpu ? "ffn_moe_cpu_whole" : "ffn_moe_gpu_whole", il);
++            return down;
++        };
++        ggml_tensor * gpu = branch(moe_cache->get_experts(gate_up_exps), moe_cache->get_experts(down_exps), slots, false);
++        ggml_build_forward_expand(gf, gpu);
++        ggml_tensor * cpu;
++        if (auto * executor = moe_cache->cpu_executor()) {
++            cpu = executor->make_join(ctx0, slots, gate_up_exps, down_exps, il);
++            ggml_backend_sched_set_tensor_backend(sched, cpu, backend_cpu);
++            cb(cpu, "ffn_moe_cpu_join", il);
++        } else {
++            ggml_tensor * miss_ids = ggml_map_custom2(ctx0, selected_experts, slots, mistral_cpu_miss_ids, 1, nullptr);
++            ggml_backend_sched_set_tensor_backend(sched, miss_ids, backend_cpu);
++            cpu = branch(gate_up_exps, down_exps, miss_ids, true);
++        }
++        ggml_tensor * experts = ggml_mul(ctx0, ggml_add(ctx0, gpu, cpu), weights);
++        cb(experts, "ffn_moe_weighted", il);
++        ggml_build_forward_expand(gf, experts);
++
++        ggml_tensor * parts[LLAMA_MAX_EXPERTS] = { nullptr };
++        const uint32_t count = hparams.n_expert_used(il);
++        GGML_ASSERT(count > 0 && count <= LLAMA_MAX_EXPERTS);
++        for (uint32_t i = 0; i < count; ++i) {
++            parts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
++            ggml_build_forward_expand(gf, parts[i]);
++        }
++        ggml_tensor * out = parts[0];
++        for (uint32_t i = 1; i < count; ++i) {
++            out = ggml_add(ctx0, out, parts[i]);
++            ggml_build_forward_expand(gf, out);
++        }
++        if (count == 1) {
++            out = ggml_cont(ctx0, out);
++        }
++        cb(out, "ffn_moe_out", il);
++        return out;
++    }
++
+     if (weight_before_ffn) {
+         // repeat cur to [n_embd, n_expert_used, n_tokens]
+         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+@@ -2432,7 +2533,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
+-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
++    // The complete-expert cache requires the experimental F32-input CUDA kernel.
++    ggml_tensor * down_slots = arch == LLM_ARCH_MISTRAL4 && std::getenv("MISTRAL_CUDA_F32_DOWN") == nullptr ? nullptr : slots;
++    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, down_slots); // [n_embd, n_expert_used, n_tokens]
+     if (arch == LLM_ARCH_MISTRAL4) {
+         // src1 can exceed F16 range
+         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
+@@ -2505,6 +2608,9 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
+         return nullptr;
+     }
+     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
++        if (arch == LLM_ARCH_MISTRAL4 && w == down_exps && std::getenv("MISTRAL_CUDA_F32_DOWN") == nullptr) {
++            continue;
++        }
+         if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
+             return nullptr;
+         }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index f22d986..f3f0de5 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-moe-cache.h"
++#include "llama-moe-cpu.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -6,7 +7,11 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
+ #include <stdexcept>
++#include <string>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -29,6 +34,7 @@ struct moe_cache_lru {
+     std::vector<uint32_t> seen; // [n_expert]
+     uint32_t seen_gen = 0;
+     std::vector<int32_t> uniq;
++    std::vector<uint64_t> frequency;
+ 
+     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+         this->n_expert = n_expert;
+@@ -44,6 +50,7 @@ struct moe_cache_lru {
+         head = 0;
+         tail = n_slots - 1;
+         seen.assign(n_expert, 0);
++        frequency.assign(n_layer*n_expert, 0);
+     }
+ 
+     // move slot s to the tail (most recently used)
+@@ -71,7 +78,7 @@ struct moe_cache_lru {
+ 
+     // give a slot to each expert selected by ids in layer il, the misses evict the least recently used experts
+     // returns false if the ids select more distinct experts than there are slots
+-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit) {
++    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, bool upload = true, bool lfu = false) {
+         fills.clear();
+         n_hit = 0;
+ 
+@@ -95,18 +102,44 @@ struct moe_cache_lru {
+ 
+         // hits go to the tail first, so the head can be evicted below
+         for (int32_t e : uniq) {
++            if (lfu) {
++                frequency[il*n_expert + e]++;
++            }
+             if (slots[e] >= 0) {
+                 touch(slots[e]);
+                 n_hit++;
+             }
+         }
+         // sorted misses usually get consecutive slots, so the uploads can be merged
++        if (!upload) {
++            return true;
++        }
+         std::sort(uniq.begin(), uniq.end());
+         for (int32_t e : uniq) {
+             if (slots[e] >= 0) {
+                 continue;
+             }
+-            const int32_t s = head;
++            int32_t s = head;
++            if (lfu) {
++                s = -1;
++                for (int32_t candidate = head; candidate >= 0; candidate = next[candidate]) {
++                    const int32_t key = key_of[candidate];
++                    if (key < 0) {
++                        s = candidate;
++                        break;
++                    }
++                    // Keep every currently selected expert in its existing slot.
++                    if (key / n_expert == il && seen[key % n_expert] == seen_gen) {
++                        continue;
++                    }
++                    if (s < 0 || frequency[key] < frequency[key_of[s]]) {
++                        s = candidate;
++                    }
++                }
++                if (s < 0 || (key_of[s] >= 0 && frequency[il*n_expert + e] <= frequency[key_of[s]])) {
++                    continue;
++                }
++            }
+             if (key_of[s] >= 0) {
+                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
+             }
+@@ -120,9 +153,13 @@ struct moe_cache_lru {
+ };
+ 
+ // gate, up, down or gate_up, down
+-static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
++static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer, llm_arch arch) {
+     std::vector<ggml_tensor *> res;
+     for (ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
++        // Enable the F32-input down kernel only for the experimental complete-expert cache.
++        if (arch == LLM_ARCH_MISTRAL4 && t == layer.ffn_down_exps && std::getenv("MISTRAL_CUDA_F32_DOWN") == nullptr) {
++            continue;
++        }
+         if (t != nullptr) {
+             res.push_back(t);
+         }
+@@ -177,6 +214,7 @@ struct llama_moe_cache::impl {
+ 
+     struct layer {
+         int32_t ig = -1;                    // -1 if the layer is not cached
++        int32_t cache_steps = 0;
+         ggml_tensor * slot_map = nullptr;   // I32 [1, n_expert] in host memory
+         std::vector<ggml_tensor *> experts; // host expert tensors, in the order of the banks
+     };
+@@ -194,12 +232,19 @@ struct llama_moe_cache::impl {
+     };
+ 
+     static constexpr int64_t max_batch = 32;
++    const bool hybrid = std::getenv("MISTRAL_CACHE_HYBRID") != nullptr;
++    const int hybrid_max_tokens = std::getenv("MISTRAL_CACHE_MAX_TOKENS") ? std::atoi(std::getenv("MISTRAL_CACHE_MAX_TOKENS")) : 1;
++    const std::string policy = std::getenv("MISTRAL_CACHE_POLICY") ? std::getenv("MISTRAL_CACHE_POLICY") : "frozen";
++    const int refresh_steps = std::getenv("MISTRAL_CACHE_REFRESH_STEPS") ? std::atoi(std::getenv("MISTRAL_CACHE_REFRESH_STEPS")) : 4;
++    const int warm_steps = std::getenv("MISTRAL_CACHE_WARM_STEPS") ? std::max(0, std::atoi(std::getenv("MISTRAL_CACHE_WARM_STEPS"))) : 64;
+ 
+     int32_t n_expert_used;
+ 
+     stats stats_small; // up to 8 tokens per ubatch
+     stats stats_large;
+     stats stats_copy;  // experts copied from the cache for large batches
++    stats stats_frozen;
++    std::ofstream routing_trace;
+ 
+     std::vector<device> devices;
+     std::vector<group> groups;
+@@ -218,8 +263,40 @@ struct llama_moe_cache::impl {
+     // views used by copy_experts
+     ggml_context_ptr ctx_views;
+ 
+-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
++    std::vector<std::unique_ptr<void, void (*)(void *)>> pinned_host;
++    std::unique_ptr<llama_moe_cpu> cpu;
++
++    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads) :
+             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
++        if (std::getenv("MISTRAL_CPU_CONCURRENT")) {
++            if (model.arch != LLM_ARCH_MISTRAL4 || !hybrid || !std::getenv("MISTRAL_CACHE_WHOLE_FFN") || !std::getenv("MISTRAL_CUDA_F32_DOWN")) {
++                throw std::runtime_error("concurrent CPU experts require the Mistral whole-FFN hybrid cache");
++            }
++            cpu = std::make_unique<llama_moe_cpu>(n_threads);
++            LLAMA_LOG_INFO("mistral: concurrent CPU expert executor enabled (%d threads)\n", n_threads);
++        }
++        if (hybrid && model.arch != LLM_ARCH_MISTRAL4) {
++            throw std::runtime_error("MISTRAL_CACHE_HYBRID requires Mistral Small 4");
++        }
++        if (hybrid_max_tokens < 1 || hybrid_max_tokens > max_batch) {
++            throw std::runtime_error("MISTRAL_CACHE_MAX_TOKENS must be between 1 and 32");
++        }
++        if (policy != "frozen" && policy != "lfu" && policy != "lru") {
++            throw std::runtime_error("MISTRAL_CACHE_POLICY must be frozen, lfu, or lru");
++        }
++        if (refresh_steps < 1 || (!hybrid && policy != "frozen")) {
++            throw std::runtime_error("adaptive cache requires hybrid mode and a positive refresh interval");
++        }
++        if (hybrid) {
++            LLAMA_LOG_INFO("%s: hybrid policy = %s, warm steps = %d, refresh steps = %d\n", __func__, policy.c_str(), warm_steps, refresh_steps);
++        }
++        if (const char * path = std::getenv("MISTRAL_CACHE_TRACE")) {
++            routing_trace.open(path);
++            if (!routing_trace) {
++                throw std::runtime_error("cannot open MISTRAL_CACHE_TRACE");
++            }
++            routing_trace << "layer,step,group,slots,expert_bytes,ids\n";
++        }
+         for (size_t i = 0; i < backends.size(); ++i) {
+             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
+             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+@@ -238,9 +315,14 @@ struct llama_moe_cache::impl {
+             throw std::runtime_error("MoE cache requires a MoE model");
+         }
+ 
+-        // only cache layers that keep all of their experts in host memory, on the device the layer is assigned to
++        // Cache eligible host expert tensors on the device assigned to their layer.
+         for (size_t il = 0; il < model.layers.size(); ++il) {
+-            auto experts = llama_moe_cache_layer_experts(model.layers[il]);
++            const auto * down = model.layers[il].ffn_down_exps;
++            if (model.arch == LLM_ARCH_MISTRAL4 && std::getenv("MISTRAL_CUDA_F32_DOWN") && down &&
++                    down->type != GGML_TYPE_Q4_K && down->type != GGML_TYPE_Q6_K) {
++                throw std::runtime_error("MISTRAL_CUDA_F32_DOWN requires Q4_K or Q6_K down experts");
++            }
++            auto experts = llama_moe_cache_layer_experts(model.layers[il], model.arch);
+             if (experts.empty() || !std::all_of(experts.begin(), experts.end(), llama_moe_cache_is_host_weight)) {
+                 continue;
+             }
+@@ -369,7 +451,7 @@ struct llama_moe_cache::impl {
+             for (int32_t il : g.layers) {
+                 layer & l = layers[il];
+                 l.ig      = (int32_t) ig;
+-                l.experts = llama_moe_cache_layer_experts(model.layers[il]);
++                l.experts = llama_moe_cache_layer_experts(model.layers[il], model.arch);
+                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                     ggml_tensor * bank   = g.banks[ip];
+                     ggml_tensor * cached = ggml_view_3d(ctx, bank, bank->ne[0], bank->ne[1], g.n_slots, bank->nb[1], bank->nb[2], 0);
+@@ -435,6 +517,34 @@ struct llama_moe_cache::impl {
+         }
+         ggml_backend_buffer_set_usage(buf_host.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+ 
++        const char * pin = std::getenv("GGML_CUDA_REGISTER_HOST");
++        if (!model.hparams.no_alloc && model.arch == LLM_ARCH_MISTRAL4 && pin && std::atoi(pin) != 0) {
++            auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(devices.front().backend));
++            auto register_host = reinterpret_cast<bool (*)(void *, size_t)>(
++                ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer"));
++            auto unregister_host = reinterpret_cast<void (*)(void *)>(
++                ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer"));
++            if (register_host && unregister_host) {
++                // Reserve before registration so allocation failure cannot leak a registered range.
++                pinned_host.reserve(layers.size()*4);
++                size_t pinned_bytes = 0;
++                for (const layer & l : layers) {
++                    for (const ggml_tensor * w : l.experts) {
++                        if (std::any_of(pinned_host.begin(), pinned_host.end(), [&](const auto & p) { return p.get() == w->data; })) {
++                            continue;
++                        }
++                        if (register_host(w->data, ggml_nbytes(w))) {
++                            pinned_host.emplace_back(w->data, unregister_host);
++                            pinned_bytes += ggml_nbytes(w);
++                        } else {
++                            LLAMA_LOG_WARN("%s: host registration failed for %s; using pageable transfers\n", __func__, w->name);
++                        }
++                    }
++                }
++                LLAMA_LOG_INFO("%s: registered %zu host expert tensors, %.2f MiB\n", __func__, pinned_host.size(), pinned_bytes/1024.0/1024.0);
++            }
++        }
++
+         for (size_t id = 0; id < devices.size(); ++id) {
+             const device & d = devices[id];
+             if (d.host_bytes == 0) {
+@@ -460,6 +570,9 @@ struct llama_moe_cache::impl {
+     }
+ 
+     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
++        if (hybrid && n_tokens > hybrid_max_tokens) {
++            return nullptr;
++        }
+         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+             return nullptr;
+         }
+@@ -518,7 +631,7 @@ struct llama_moe_cache::impl {
+             return false;
+         }
+         const int32_t il = it->second;
+-        const layer & l = layers[il];
++        layer & l = layers[il];
+         group & g = groups[l.ig];
+ 
+         GGML_ASSERT(backend == devices[g.id].backend);
+@@ -534,6 +647,18 @@ struct llama_moe_cache::impl {
+         }
+         GGML_ASSERT(lookup != nullptr);
+ 
++        // Only tagged whole-expert decode graphs publish work to the private CPU executor.
++        const ggml_tensor * activation = nullptr;
++        if (cpu) {
++            for (int i = 0; i < n_nodes; ++i) {
++                const auto * node = ggml_graph_node(graph, i);
++                if (node->op == GGML_OP_MUL_MAT_ID && node->op_params[5] == llama_moe_cpu::graph_tag) {
++                    GGML_ASSERT(activation == nullptr);
++                    activation = node->src[1];
++                }
++            }
++        }
++
+         // the selected experts must be computed in an earlier split
+         // the scheduler starts a new split at the lookup because it reads a host weight, but only if the split already has inputs
+         const ggml_tensor * sel = lookup->src[1];
+@@ -546,14 +671,44 @@ struct llama_moe_cache::impl {
+         GGML_ASSERT(ggml_is_contiguous(sel));
+ 
+         ids.resize(ggml_nelements(sel));
++        if (activation) {
++            const auto * base = activation->view_src ? activation->view_src : activation;
++            for (int i = 0; i < n_nodes; ++i) {
++                // The router depends on this activation, so it must precede the cache split.
++                GGML_ASSERT(ggml_graph_node(graph, i) != base);
++            }
++            auto * input = cpu->input(il);
++            GGML_ASSERT(activation->type == GGML_TYPE_F32 && ggml_is_contiguous(activation));
++            GGML_ASSERT(ggml_nbytes(activation) == ggml_nbytes(input));
++            ggml_backend_tensor_get_async(backend, activation, input->data, 0, ggml_nbytes(input));
++        }
+         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
++        // Both host copies must complete before the worker sees their data.
+         ggml_backend_synchronize(backend);
+ 
++        if (routing_trace.is_open()) {
++            size_t expert_bytes = 0;
++            for (const auto * w : l.experts) {
++                expert_bytes += w->nb[2];
++            }
++            routing_trace << il << ',' << l.cache_steps << ',' << l.ig << ',' << g.n_slots << ',' << expert_bytes << ',';
++            for (size_t i = 0; i < ids.size(); ++i) {
++                routing_trace << (i ? " " : "") << ids[i];
++            }
++            routing_trace << '\n';
++        }
++
+         size_t n_hit = 0;
+-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
++        const int step = l.cache_steps++;
++        const bool upload = !hybrid || step < warm_steps || (policy != "frozen" && step % refresh_steps == 0);
++        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, upload, policy == "lfu")) {
+             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+         }
+ 
++        if (activation) {
++            cpu->launch(il, ids.data(), static_cast<const int32_t *>(l.slot_map->data), ids.size());
++        }
++
+         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+         size_t bytes = 0;
+         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+@@ -573,8 +728,13 @@ struct llama_moe_cache::impl {
+ 
+         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+         st.hits   += n_hit;
+-        st.misses += fills.size();
++        st.misses += g.lru.uniq.size() - n_hit;
+         st.bytes  += bytes;
++        if (hybrid && step >= warm_steps) {
++            stats_frozen.hits += n_hit;
++            stats_frozen.misses += g.lru.uniq.size() - n_hit;
++            stats_frozen.bytes += bytes;
++        }
+ 
+         // the next copy synchronizes the backend before it changes the slot map again
+         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+@@ -593,18 +753,23 @@ struct llama_moe_cache::impl {
+         };
+         log("ubatch <= 8", stats_small);
+         log("ubatch  > 8", stats_large);
++        log(policy == "frozen" ? "hybrid frozen" : "hybrid steady", stats_frozen);
+         if (stats_copy.hits > 0) {
+             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
+         }
+     }
+ };
+ 
+-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
+-    pimpl(new impl(model, backends, bufts, size)) {
++llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads) :
++    pimpl(new impl(model, backends, bufts, size, n_threads)) {
+ }
+ 
+ llama_moe_cache::~llama_moe_cache() = default;
+ 
++llama_moe_cpu * llama_moe_cache::cpu_executor() const {
++    return pimpl->cpu.get();
++}
++
+ ggml_backend_t llama_moe_cache::backend(int32_t il) const {
+     return pimpl->backend(il);
+ }
+@@ -635,5 +800,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
+     if (pimpl->buf_host) {
+         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
+     }
++    if (pimpl->cpu) {
++        res[ggml_backend_cpu_buffer_type()] += pimpl->cpu->buffer_size();
++    }
+     return res;
+ }
+diff --git a/src/llama-moe-cache.h b/src/llama-moe-cache.h
+index 3b6726b..d2e6124 100644
+--- a/src/llama-moe-cache.h
++++ b/src/llama-moe-cache.h
+@@ -7,17 +7,19 @@
+ #include <vector>
+ 
+ struct llama_model;
++class llama_moe_cpu;
+ 
+ // keeps the most recently used experts of host-resident MoE layers in a device buffer
+ // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
+ class llama_moe_cache {
+ public:
+     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
++    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, int n_threads);
+     ~llama_moe_cache();
+ 
+     // the device that caches layer il
+     ggml_backend_t backend(int32_t il) const;
++    llama_moe_cpu * cpu_executor() const;
+ 
+     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
+     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+diff --git a/src/models/deepseek2.cpp b/src/models/deepseek2.cpp
+index 5fd24d1..e24cba0 100644
+--- a/src/models/deepseek2.cpp
++++ b/src/models/deepseek2.cpp
+@@ -457,6 +457,7 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        res->t_layer_inp[il] = inpL;
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 991bf54..3e5a38e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -314,6 +314,9 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
+ endif()
+ 
+ llama_build(test-backend-ops.cpp LINK ggml)
++if (GGML_CPU)
++    llama_build_and_test(test-mistral-moe-cpu.cpp LINK llama)
++endif()
+ 
+ llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ba7f7eb..37b1f97 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -5539,6 +5539,68 @@ struct test_mul_mat_id : public test_case {
+     }
+ };
+ 
++struct test_mul_mat_id_masked : public test_mul_mat_id {
++    const bool all_masked;
++    test_mul_mat_id_masked(ggml_type type, int n, bool all_masked, float max_a = 1e5f, bool broadcast = false)
++        : test_mul_mat_id(type, GGML_TYPE_F32, 8, 4, broadcast, 65, n, 2048, max_a, 80, true), all_masked(all_masked) {}
++    std::string vars() override {
++        return test_mul_mat_id::vars() + ",masked=1,all_masked=" + std::to_string(all_masked);
++    }
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
++        out->op_params[4] = 1;
++        return out;
++    }
++    void initialize_tensors(ggml_context * ctx) override {
++        test_mul_mat_id::initialize_tensors(ctx);
++        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
++        std::vector<int32_t> values(ggml_nelements(ids));
++        ggml_backend_tensor_get(ids, values.data(), 0, ggml_nbytes(ids));
++        for (size_t i = 0; i < values.size(); ++i) {
++            if (all_masked || i % 2 == 0) {
++                values[i] = -1;
++            }
++        }
++        ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
++    }
++};
++
++struct test_mistral_expert_ffn : public test_case {
++    const ggml_type down_type;
++    const int mask;
++    const float amax;
++
++    test_mistral_expert_ffn(ggml_type down_type, int mask, float amax) : down_type(down_type), mask(mask), amax(amax) {}
++    std::string op_desc(ggml_tensor *) override { return "MISTRAL_EXPERT_FFN"; }
++    std::string vars() override { return VARS_TO_STR3(down_type, mask, amax); }
++    double max_nmse_err() override { return 5e-4; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * gu_w = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_K, 4096, 4096, 8);
++        ggml_tensor * down_w = ggml_new_tensor_3d(ctx, down_type, 2048, 4096, 8);
++        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4096, 1, 1);
++        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 1);
++        ggml_set_name(x, "ffn_input");
++        ggml_set_name(ids, "ffn_ids");
++        ggml_tensor * gu = ggml_mul_mat_id(ctx, gu_w, x, ids);
++        gu->op_params[4] = 1;
++        ggml_tensor * gate = ggml_view_3d(ctx, gu, 2048, 4, 1, gu->nb[1], gu->nb[2], 0);
++        ggml_tensor * up = ggml_view_3d(ctx, gu, 2048, 4, 1, gu->nb[1], gu->nb[2], 2048*gu->nb[0]);
++        ggml_tensor * act = ggml_swiglu_split(ctx, gate, up);
++        ggml_tensor * out = ggml_mul_mat_id(ctx, down_w, act, ids);
++        out->op_params[4] = 1;
++        ggml_prec_set_src(out, GGML_PREC_F32, 1);
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        init_mul_mat_id_tensors(ctx, 8);
++        init_tensor_uniform(ggml_get_tensor(ctx, "ffn_input"), -amax, amax);
++        const int32_t ids[3][4] = {{ 7, 2, 5, 0 }, { -1, 2, -1, 0 }, { -1, -1, -1, -1 }};
++        ggml_backend_tensor_set(ggml_get_tensor(ctx, "ffn_ids"), ids[mask], 0, sizeof(ids[mask]));
++    }
++};
++
+ // MUL_MAT_ID with expert ids repeated within a token's row
+ struct test_mul_mat_id_dup : public test_mul_mat_id {
+     using test_mul_mat_id::test_mul_mat_id;
+@@ -11067,7 +11129,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 16, 10, 256));
+     }
+ 
++    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
++        for (int mask : {0, 1, 2}) {
++            for (float amax : {1.0f, 64.0f}) {
++                test_cases.emplace_back(new test_mistral_expert_ffn(type, mask, amax));
++            }
++        }
++    }
++
+     // test src1 f16 overflow
++    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
++        for (int n : {1, 2, 4, 8}) {
++            for (bool all : {false, true}) {
++                for (bool broadcast : {false, true}) {
++                    test_cases.emplace_back(new test_mul_mat_id_masked(type, n, all, 1.0f, broadcast));
++                }
++            }
++        }
++    }
++    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
++        for (int n : {1, 4}) {
++            for (bool all : {false, true}) {
++                test_cases.emplace_back(new test_mul_mat_id_masked(type, n, all));
++            }
++        }
++    }
++    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
++        for (int n : {1, 4, 33}) {
++            for (bool broadcast : {false, true}) {
++                test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 8, 4, broadcast, 65, n, 2048, 1e5f, 80, true));
++            }
++        }
++    }
+     for (int n : {16, 32, 64}) {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
+diff --git a/ggml/src/ggml-cuda/mmvq-f32.cu b/ggml/src/ggml-cuda/mmvq-f32.cu
+new file mode 100644
+index 0000000..4496070
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-f32.cu
+@@ -0,0 +1,88 @@
++#include "mmvq-f32.cuh"
++#include "dequantize.cuh"
++
++// Preserve F32 activation range instead of converting activations or their block sums to F16.
++template<ggml_type type>
++static __global__ void mul_mat_id_f32(
++        const char * weights, const char * activations, const char * ids, char * output,
++        int64_t k, int64_t rows, int64_t channels,
++        size_t w_row, size_t w_expert, size_t a_channel, size_t a_token,
++        size_t ids_token, size_t out_channel, size_t out_token, bool masked) {
++    const int lane = threadIdx.x % 32;
++    const int64_t row = int64_t(blockIdx.x) * 4 + threadIdx.x / 32;
++    if (row >= rows) {
++        return;
++    }
++    const int slot = blockIdx.y;
++    const int token = blockIdx.z;
++    const int expert = reinterpret_cast<const int32_t *>(ids + token * ids_token)[slot];
++    if (masked && expert == -1) {
++        if (lane == 0) {
++            reinterpret_cast<float *>(output + slot * out_channel + token * out_token)[row] = 0.0f;
++        }
++        return;
++    }
++    const char * w = weights + expert * w_expert + row * w_row;
++    const float * a = reinterpret_cast<const float *>(activations + (slot % channels) * a_channel + token * a_token);
++    float sum = 0.0f;
++    for (int64_t ib = 0; ib < k / QK_K; ++ib) {
++#pragma unroll
++        for (int group = 0; group < 8; ++group) {
++            const int64_t col = ib*QK_K + group*32 + lane;
++            float v;
++            if constexpr (type == GGML_TYPE_Q4_K) {
++                const block_q4_K & b = reinterpret_cast<const block_q4_K *>(w)[ib];
++                uint8_t scale, min;
++                get_scale_min_k4(group, b.scales, scale, min);
++                const int q = (b.qs[(group / 2)*32 + lane] >> (4*(group % 2))) & 15;
++                v = float(__low2half(b.dm))*scale*q - float(__high2half(b.dm))*min;
++            } else {
++                const block_q6_K & b = reinterpret_cast<const block_q6_K *>(w)[ib];
++                const int half = group / 4;
++                const int sub = group % 4;
++                const int lo = (b.ql[half*64 + (sub % 2)*32 + lane] >> (sub >= 2 ? 4 : 0)) & 15;
++                const int hi = (b.qh[half*32 + lane] >> (2*sub)) & 3;
++                v = float(b.d)*b.scales[half*8 + sub*2 + lane/16]*((lo | (hi << 4)) - 32);
++            }
++            sum = fmaf(v, a[col], sum);
++        }
++    }
++    for (int offset = 16; offset > 0; offset /= 2) {
++        sum += __shfl_down_sync(0xffffffff, sum, offset);
++    }
++    if (lane == 0) {
++        reinterpret_cast<float *>(output + slot * out_channel + token * out_token)[row] = sum;
++    }
++}
++
++bool ggml_cuda_supports_mmq_f32_input(const ggml_tensor * dst) {
++    const ggml_tensor * w = dst->src[0];
++    const ggml_tensor * a = dst->src[1];
++    const ggml_tensor * ids = dst->src[2];
++    return dst->op == GGML_OP_MUL_MAT_ID &&
++        (w->type == GGML_TYPE_Q4_K || w->type == GGML_TYPE_Q6_K) &&
++        a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
++        w->nb[0] == ggml_type_size(w->type) && a->nb[0] == sizeof(float) &&
++        ids->nb[0] == sizeof(int32_t) && dst->nb[0] == sizeof(float) &&
++        w->ne[0] % QK_K == 0 && w->ne[3] == 1 && a->ne[3] == 1 && dst->ne[3] == 1 &&
++        dst->ne[1] <= 65535 && dst->ne[2] <= 65535;
++}
++
++void ggml_cuda_mul_mat_id_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    GGML_ASSERT(ggml_cuda_supports_mmq_f32_input(dst));
++    const ggml_tensor * w = dst->src[0];
++    const ggml_tensor * a = dst->src[1];
++    const ggml_tensor * ids = dst->src[2];
++    const dim3 grid((dst->ne[0] + 3) / 4, dst->ne[1], dst->ne[2]);
++#define LAUNCH(TYPE) mul_mat_id_f32<TYPE><<<grid, 128, 0, ctx.stream()>>>( \
++        (const char *) w->data, (const char *) a->data, (const char *) ids->data, (char *) dst->data, \
++        w->ne[0], dst->ne[0], a->ne[1], w->nb[1], w->nb[2], a->nb[1], a->nb[2], \
++        ids->nb[1], dst->nb[1], dst->nb[2], ggml_get_op_params_i32(dst, 4) == 1)
++    if (w->type == GGML_TYPE_Q4_K) {
++        LAUNCH(GGML_TYPE_Q4_K);
++    } else {
++        LAUNCH(GGML_TYPE_Q6_K);
++    }
++#undef LAUNCH
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/mmvq-f32.cuh b/ggml/src/ggml-cuda/mmvq-f32.cuh
+new file mode 100644
+index 0000000..d6a98fd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-f32.cuh
+@@ -0,0 +1,6 @@
++#pragma once
++
++#include "common.cuh"
++
++bool ggml_cuda_supports_mmq_f32_input(const ggml_tensor * dst);
++void ggml_cuda_mul_mat_id_f32(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/llama-moe-cpu.cpp b/src/llama-moe-cpu.cpp
+new file mode 100644
+index 0000000..154e258
+--- /dev/null
++++ b/src/llama-moe-cpu.cpp
+@@ -0,0 +1,219 @@
++#include "llama-moe-cpu.h"
++
++#include "ggml-cpp.h"
++
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <stdexcept>
++#include <thread>
++
++#ifdef MISTRAL_MOE_NVTX
++#include <nvtx3/nvToolsExt.h>
++#endif
++
++struct llama_moe_cpu::impl {
++    struct job {
++        impl * owner;
++        ggml_context_ptr ctx;
++        ggml_backend_buffer_ptr buffer;
++        ggml_cgraph * graph;
++        ggml_tensor * input;
++        ggml_tensor * ids;
++        ggml_tensor * output;
++        int64_t n_expert;
++        bool has_misses = false;
++        bool published = false;
++    };
++
++    ggml_backend_ptr backend;
++    std::map<int, std::unique_ptr<job>> jobs;
++    std::mutex mutex;
++    std::condition_variable cv;
++    job * pending = nullptr;
++    bool stopping = false;
++    ggml_status status = GGML_STATUS_SUCCESS;
++    const bool serial = std::getenv("MISTRAL_CPU_CONCURRENT_SERIAL") != nullptr;
++    uint64_t launches = 0;
++    uint64_t all_hit = 0;
++    uint64_t ready_at_join = 0;
++    std::thread worker;
++
++    explicit impl(int n_threads) {
++        backend.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++        if (!backend || n_threads < 1) {
++            throw std::runtime_error("cannot initialize the Mistral CPU executor");
++        }
++        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
++        auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
++            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
++        if (!set_threads) {
++            throw std::runtime_error("CPU executor backend cannot set its thread count");
++        }
++        set_threads(backend.get(), n_threads);
++        worker = std::thread([this] {
++            std::unique_lock<std::mutex> lock(mutex);
++            for (;;) {
++                cv.wait(lock, [this] { return pending || stopping; });
++                if (!pending) {
++                    return;
++                }
++                job * current = pending;
++                lock.unlock();
++                const auto result = compute(*current);
++                lock.lock();
++                status = result;
++                pending = nullptr;
++                cv.notify_all();
++            }
++        });
++    }
++
++    ~impl() {
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping = true;
++        }
++        cv.notify_all();
++        worker.join(); // Finish even when graph evaluation aborts before the join node.
++        fprintf(stderr, "mistral CPU executor: jobs=%llu, all-hit=%llu, ready-at-join=%llu, mode=%s\n",
++                (unsigned long long) launches, (unsigned long long) all_hit,
++                (unsigned long long) ready_at_join, serial ? "serial-control" : "concurrent");
++    }
++
++    ggml_status compute(job & j) {
++#ifdef MISTRAL_MOE_NVTX
++        nvtxRangePushA("mistral.cpu.experts");
++#endif
++        ggml_status result = GGML_STATUS_SUCCESS;
++        try {
++            result = ggml_backend_graph_compute(backend.get(), j.graph);
++        } catch (...) {
++            result = GGML_STATUS_FAILED;
++        }
++#ifdef MISTRAL_MOE_NVTX
++        nvtxRangePop();
++#endif
++        return result;
++    }
++
++    void wait() {
++        std::unique_lock<std::mutex> lock(mutex);
++        cv.wait(lock, [this] { return pending == nullptr; });
++        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
++    }
++
++    static void join(ggml_tensor * dst, int ith, int nth, void * userdata) {
++        GGML_ASSERT(ith == 0 && nth == 1);
++        auto & j = *static_cast<job *>(userdata);
++        {
++            std::lock_guard<std::mutex> lock(j.owner->mutex);
++            j.owner->ready_at_join += j.owner->pending == nullptr;
++        }
++        j.owner->wait();
++        GGML_ASSERT(j.published);
++        GGML_ASSERT(ggml_nbytes(dst) == ggml_nbytes(j.output));
++        std::memcpy(dst->data, j.output->data, ggml_nbytes(dst));
++        j.published = false;
++    }
++
++    job & prepare(int il, ggml_tensor * gate_up, ggml_tensor * down, int64_t n_used) {
++        auto it = jobs.find(il);
++        if (it != jobs.end()) {
++            GGML_ASSERT(it->second->ids->ne[0] == n_used);
++            return *it->second;
++        }
++        // This executor is deliberately restricted to the tested Mistral Small 4 layout.
++        if (gate_up->ne[0] != 4096 || gate_up->ne[1] != 4096 || gate_up->ne[2] < 4 || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
++            down->ne[0] != 2048 || down->ne[1] != 4096 || down->ne[2] != gate_up->ne[2] || down->ne[3] != 1 || n_used != 4 ||
++            (gate_up->type != GGML_TYPE_Q4_K && gate_up->type != GGML_TYPE_Q6_K) ||
++            (down->type != GGML_TYPE_Q4_K && down->type != GGML_TYPE_Q6_K) ||
++            !gate_up->buffer || !down->buffer ||
++            !ggml_backend_buffer_is_host(gate_up->buffer) || !ggml_backend_buffer_is_host(down->buffer)) {
++            throw std::runtime_error("unsupported concurrent Mistral expert layout");
++        }
++        auto j = std::make_unique<job>();
++        j->owner = this;
++        j->n_expert = gate_up->ne[2];
++        j->ctx.reset(ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead_custom(32, false), nullptr, true}));
++        if (!j->ctx) {
++            throw std::runtime_error("cannot allocate CPU executor context");
++        }
++        auto * ctx = j->ctx.get();
++        j->input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, gate_up->ne[0], 1, 1);
++        j->ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
++        const auto mm = [&](ggml_tensor * w, ggml_tensor * a) {
++            auto * t = ggml_mul_mat_id(ctx, w, a, j->ids);
++            t->op_params[4] = 1;
++            ggml_prec_set_src(t, GGML_PREC_F32, 1);
++            return t;
++        };
++        auto * gu = mm(gate_up, j->input);
++        const int64_t n_ff = gu->ne[0]/2;
++        auto * gate = ggml_view_3d(ctx, gu, n_ff, n_used, 1, gu->nb[1], gu->nb[2], 0);
++        auto * up = ggml_view_3d(ctx, gu, n_ff, n_used, 1, gu->nb[1], gu->nb[2], n_ff*gu->nb[0]);
++        j->output = mm(down, ggml_swiglu_split(ctx, gate, up));
++        j->graph = ggml_new_graph_custom(ctx, 32, false);
++        ggml_build_forward_expand(j->graph, j->output);
++        j->buffer.reset(ggml_backend_alloc_ctx_tensors(ctx, backend.get()));
++        if (!j->buffer) {
++            throw std::runtime_error("cannot allocate CPU executor tensors");
++        }
++        auto & result = *j;
++        jobs.emplace(il, std::move(j));
++        return result;
++    }
++};
++
++llama_moe_cpu::llama_moe_cpu(int n_threads) : pimpl(new impl(n_threads)) {}
++llama_moe_cpu::~llama_moe_cpu() = default;
++
++ggml_tensor * llama_moe_cpu::make_join(ggml_context * ctx, ggml_tensor * slots, ggml_tensor * gate_up,
++                                      ggml_tensor * down, int il) {
++    auto & j = pimpl->prepare(il, gate_up, down, slots->ne[0]);
++    // The small slot dependency keeps the join after the cache callback. Scheduler fences remain intact.
++    ggml_tensor * args[] = {slots};
++    return ggml_custom_4d(ctx, GGML_TYPE_F32, down->ne[1], slots->ne[0], 1, 1, args, 1, impl::join, 1, &j);
++}
++
++ggml_tensor * llama_moe_cpu::input(int il) {
++    pimpl->wait(); // Own the staging buffer before a DtoH transfer or a new publication.
++    return pimpl->jobs.at(il)->input;
++}
++
++void llama_moe_cpu::launch(int il, const int32_t * ids, const int32_t * slot_map, size_t count) {
++    auto & j = *pimpl->jobs.at(il);
++    GGML_ASSERT(count == (size_t) j.ids->ne[0]);
++    // An aborted graph may leave an unconsumed result; input() already waited for it.
++    j.published = true;
++    auto * miss_ids = static_cast<int32_t *>(j.ids->data);
++    j.has_misses = false;
++    for (size_t i = 0; i < count; ++i) {
++        GGML_ASSERT(ids[i] >= 0 && ids[i] < j.n_expert);
++        miss_ids[i] = slot_map[ids[i]] < 0 ? ids[i] : -1;
++        j.has_misses |= miss_ids[i] >= 0;
++    }
++    ++pimpl->launches;
++    if (!j.has_misses) {
++        ++pimpl->all_hit;
++        std::memset(j.output->data, 0, ggml_nbytes(j.output));
++    } else if (pimpl->serial) {
++        pimpl->status = pimpl->compute(j);
++    } else {
++        std::lock_guard<std::mutex> lock(pimpl->mutex);
++        GGML_ASSERT(!pimpl->pending);
++        pimpl->pending = &j;
++        pimpl->cv.notify_one();
++    }
++}
++
++size_t llama_moe_cpu::buffer_size() const {
++    size_t bytes = 0;
++    for (const auto & entry : pimpl->jobs) {
++        bytes += ggml_backend_buffer_get_size(entry.second->buffer.get());
++    }
++    return bytes;
++}
+diff --git a/src/llama-moe-cpu.h b/src/llama-moe-cpu.h
+new file mode 100644
+index 0000000..ca6d53a
+--- /dev/null
++++ b/src/llama-moe-cpu.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include "ggml.h"
++
++#include <memory>
++
++// Private single-token executor. Its tensors and CPU backend are independent of the scheduler.
++class llama_moe_cpu {
++public:
++    static constexpr int graph_tag = 0x435055;
++
++    explicit llama_moe_cpu(int n_threads);
++    ~llama_moe_cpu();
++
++    ggml_tensor * make_join(ggml_context * ctx, ggml_tensor * slots, ggml_tensor * gate_up,
++                           ggml_tensor * down, int il);
++    ggml_tensor * input(int il);
++    void launch(int il, const int32_t * ids, const int32_t * slot_map, size_t count);
++    size_t buffer_size() const;
++
++private:
++    struct impl;
++    std::unique_ptr<impl> pimpl;
++};
+diff --git a/tests/test-mistral-moe-cpu.cpp b/tests/test-mistral-moe-cpu.cpp
+new file mode 100644
+index 0000000..bf82ad5
+--- /dev/null
++++ b/tests/test-mistral-moe-cpu.cpp
+@@ -0,0 +1,105 @@
++#include "../src/llama-moe-cpu.h"
++#include "ggml-cpp.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++static void initialize_weight(ggml_tensor * w) {
++    std::vector<float> row(w->ne[0]);
++    std::vector<uint8_t> quant(ggml_row_size(w->type, w->ne[0]));
++    for (int64_t e = 0; e < w->ne[2]; ++e) {
++        for (int64_t k = 0; k < w->ne[0]; ++k) {
++            row[k] = 0.01f*std::sin(float(k*17 + e*73));
++        }
++        ggml_quantize_chunk(w->type, row.data(), quant.data(), 0, 1, w->ne[0], nullptr);
++        for (int64_t r = 0; r < w->ne[1]; ++r) {
++            std::memcpy((char *) w->data + e*w->nb[2] + r*w->nb[1], quant.data(), quant.size());
++        }
++    }
++}
++
++static void test_type(ggml_type down_type) {
++    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
++    GGML_ASSERT(cpu);
++    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu.get()));
++    auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
++    GGML_ASSERT(set_threads);
++    set_threads(cpu.get(), 4);
++    ggml_context_ptr ctx(ggml_init({64*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(32, false), nullptr, true}));
++    auto * gu_w = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q4_K, 4096, 4096, 8);
++    auto * down_w = ggml_new_tensor_3d(ctx.get(), down_type, 2048, 4096, 8);
++    // Allocate weights before the executor validates their host residency.
++    ggml_backend_buffer_ptr weights(ggml_backend_alloc_ctx_tensors(ctx.get(), cpu.get()));
++    GGML_ASSERT(weights);
++    initialize_weight(gu_w);
++    initialize_weight(down_w);
++
++    auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 4096, 1, 1);
++    auto * miss = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, 1);
++    auto * slots = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, 1);
++    auto * gu = ggml_mul_mat_id(ctx.get(), gu_w, x, miss);
++    gu->op_params[4] = 1;
++    ggml_prec_set_src(gu, GGML_PREC_F32, 1);
++    auto * gate = ggml_view_3d(ctx.get(), gu, 2048, 4, 1, gu->nb[1], gu->nb[2], 0);
++    auto * up = ggml_view_3d(ctx.get(), gu, 2048, 4, 1, gu->nb[1], gu->nb[2], 2048*sizeof(float));
++    auto * expected = ggml_mul_mat_id(ctx.get(), down_w, ggml_swiglu_split(ctx.get(), gate, up), miss);
++    expected->op_params[4] = 1;
++    ggml_prec_set_src(expected, GGML_PREC_F32, 1);
++    auto * reference = ggml_new_graph_custom(ctx.get(), 32, false);
++    ggml_build_forward_expand(reference, expected);
++
++    auto executor = std::make_unique<llama_moe_cpu>(4);
++    auto * actual = executor->make_join(ctx.get(), slots, gu_w, down_w, 0);
++    auto * joined = ggml_new_graph_custom(ctx.get(), 32, false);
++    ggml_build_forward_expand(joined, actual);
++    // A second layer checks the single worker's cross-layer ownership barrier.
++    executor->make_join(ctx.get(), slots, gu_w, down_w, 1);
++    ggml_backend_buffer_ptr scratch(ggml_backend_alloc_ctx_tensors(ctx.get(), cpu.get()));
++    GGML_ASSERT(scratch);
++
++    for (int iteration = 0; iteration < 50; ++iteration) {
++        const int n_miss = iteration % 5;
++        int32_t ids[4];
++        int32_t map[8];
++        for (int & v : map) { v = -1; }
++        for (int i = 0; i < 4; ++i) {
++            ids[i] = (iteration + 2*i) % 8;
++            map[ids[i]] = i < n_miss ? -1 : i;
++            static_cast<int32_t *>(miss->data)[i] = i < n_miss ? ids[i] : -1;
++        }
++        for (int k = 0; k < 4096; ++k) {
++            static_cast<float *>(x->data)[k] = (iteration % 2 ? 64.0f : 1.0f)*std::sin(float(k*13 + iteration));
++        }
++        auto * input = executor->input(0);
++        std::memcpy(input->data, x->data, ggml_nbytes(x));
++        executor->launch(0, ids, map, 4);
++        // The worker must use its copied IDs, not these caller-owned arrays.
++        std::memset(ids, 0xff, sizeof(ids));
++        std::memset(map, 0xff, sizeof(map));
++        GGML_ASSERT(ggml_backend_graph_compute(cpu.get(), reference) == GGML_STATUS_SUCCESS);
++        GGML_ASSERT(ggml_backend_graph_compute(cpu.get(), joined) == GGML_STATUS_SUCCESS);
++        GGML_ASSERT(std::memcmp(actual->data, expected->data, ggml_nbytes(actual)) == 0);
++        for (int64_t i = 0; i < ggml_nelements(actual); ++i) {
++            GGML_ASSERT(std::isfinite(static_cast<float *>(actual->data)[i]));
++        }
++    }
++    // Simulate an aborted evaluation: publish, skip join, then reuse for another layer.
++    int32_t ids[] = {0, 1, 2, 3};
++    int32_t map[] = {-1, -1, -1, -1, -1, -1, -1, -1};
++    std::memcpy(executor->input(0)->data, x->data, ggml_nbytes(x));
++    executor->launch(0, ids, map, 4);
++    std::memcpy(executor->input(1)->data, x->data, ggml_nbytes(x));
++    executor->launch(1, ids, map, 4);
++    executor.reset(); // Outstanding work must finish before tensor/weight destruction.
++    printf("%s: 50 bitwise checks, caller-buffer poisoning, cross-layer reuse and pending destruction passed\n", ggml_type_name(down_type));
++}
++
++int main() {
++    ggml_backend_load_all();
++    test_type(GGML_TYPE_Q4_K);
++    test_type(GGML_TYPE_Q6_K);
++    return 0;
++}

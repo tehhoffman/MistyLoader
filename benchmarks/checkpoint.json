@@ -1,0 +1,280 @@
+{
+  "version": "0.1.0",
+  "measured_date": "2026-10-15",
+  "hardware": {
+    "cpu": "AMD Ryzen 9 5950X",
+    "ram_gib_approx": 128,
+    "gpu": [
+      "RTX 3060 12GB",
+      "RTX 3060 12GB"
+    ],
+    "gpu_interconnect": "PCIe 4 x8, no NVLink"
+  },
+  "model": {
+    "tested_filename": "mistral-small-4-uncensored-scale-repaired-Q4_K_M.gguf",
+    "tested_sha256": "35d2240fcd50316bae8501c9b38d9cc6c60058f0b29e1c8af0e93c3ebc7743f0",
+    "source_repository": "timteh673/Mistral-Small-4-119B-Uncensored-GGUF",
+    "source_revision": "bff209356d49488f38289978977044baa2167730",
+    "source_filename": "Mistral-Small-4-119B-Uncensored-Q4_K_M.gguf",
+    "source_sha256": "c8455ca33799c5460d21be23f70193ed826a6ec1fb0fe8229b29898755b079bd",
+    "official_repository": "mistralai/Mistral-Small-4-119B-2603",
+    "official_revision": "a11f36bebf709121056b1dbcc943d1c6afbe494d",
+    "repair_status": "Experimental rescaling of Q4_K d/dmin and Q6_K d fields; not equivalent to a fresh conversion."
+  },
+  "method": {
+    "context_allocation": 8192,
+    "prompt_tokens": 512,
+    "fixed_output_limit": 256,
+    "story_output_limit": 384,
+    "story_order": [
+      "fantasy",
+      "science fiction",
+      "detective",
+      "fantasy",
+      "science fiction",
+      "detective"
+    ],
+    "cache_mib": 16384,
+    "warmed_mean": "Arithmetic mean excluding the first request. Decode only; prompt processing is separate.",
+    "story_prefill_threads": 16
+  },
+  "fixed": {
+    "speed-whole-skip-c16-t16": {
+      "rates_tok_s": [
+        18.56332664131474,
+        23.03667664772088,
+        23.205530014305523
+      ],
+      "warmed_mean_tok_s": 23.121103331013202,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc"
+      ],
+      "generated_tokens": [
+        256,
+        256,
+        256
+      ],
+      "gpu_peak_mib": {
+        "0": 11857.0,
+        "1": 9547.0
+      },
+      "rss_peak_gib": 67.65233993530273,
+      "swap_peak_kib": 0
+    },
+    "speed-concurrent-serial-t16": {
+      "rates_tok_s": [
+        18.74708868740384,
+        23.23870441762303,
+        23.112313152809552
+      ],
+      "warmed_mean_tok_s": 23.17550878521629,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc"
+      ],
+      "generated_tokens": [
+        256,
+        256,
+        256
+      ],
+      "gpu_peak_mib": {
+        "0": 11382.0,
+        "1": 9551.0
+      },
+      "rss_peak_gib": 67.66694641113281,
+      "swap_peak_kib": 0
+    },
+    "speed-concurrent-v1-t16": {
+      "rates_tok_s": [
+        20.895303956611844,
+        25.793446886538774,
+        26.061878462524955
+      ],
+      "warmed_mean_tok_s": 25.927662674531867,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc"
+      ],
+      "generated_tokens": [
+        256,
+        256,
+        256
+      ],
+      "gpu_peak_mib": {
+        "0": 11373.0,
+        "1": 9551.0
+      },
+      "rss_peak_gib": 67.66940689086914,
+      "swap_peak_kib": 0
+    },
+    "speed-concurrent-v1-t12": {
+      "rates_tok_s": [
+        21.201420478543497,
+        25.91384672355992,
+        26.844382797108896
+      ],
+      "warmed_mean_tok_s": 26.37911476033441,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc"
+      ],
+      "generated_tokens": [
+        256,
+        256,
+        256
+      ],
+      "gpu_peak_mib": {
+        "0": 11316.0,
+        "1": 9553.0
+      },
+      "rss_peak_gib": 67.66986083984375,
+      "swap_peak_kib": 0
+    }
+  },
+  "story": {
+    "strata-story-whole-skip-t16": {
+      "rates_tok_s": [
+        20.334496534856157,
+        23.015335124705103,
+        23.449980702620046,
+        23.330364693979643,
+        24.347061103767764,
+        23.954623059605286
+      ],
+      "warmed_mean_tok_s": 23.61947293693557,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "bcce9e6847e83f4fd053ce961a1873b49e8ac83c8770f49ce16630e592ee4fe1",
+        "ee968ff3aa2cf4fdd3060176d168f3307a66dc2432636ec7df616e81bed13753",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "bcce9e6847e83f4fd053ce961a1873b49e8ac83c8770f49ce16630e592ee4fe1",
+        "ee968ff3aa2cf4fdd3060176d168f3307a66dc2432636ec7df616e81bed13753"
+      ],
+      "generated_tokens": [
+        378,
+        334,
+        313,
+        365,
+        332,
+        342
+      ],
+      "gpu_peak_mib": {
+        "0": 11430.0,
+        "1": 9551.0
+      },
+      "rss_peak_gib": 67.66529083251953,
+      "swap_peak_kib": 0
+    },
+    "concurrent-story-t16": {
+      "rates_tok_s": [
+        22.286037927289705,
+        25.14688651338494,
+        25.57064542357979,
+        26.2253261288616,
+        26.953594054118582,
+        26.53241214250784
+      ],
+      "warmed_mean_tok_s": 26.08577285249055,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "bcce9e6847e83f4fd053ce961a1873b49e8ac83c8770f49ce16630e592ee4fe1",
+        "ee968ff3aa2cf4fdd3060176d168f3307a66dc2432636ec7df616e81bed13753",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "bcce9e6847e83f4fd053ce961a1873b49e8ac83c8770f49ce16630e592ee4fe1",
+        "ee968ff3aa2cf4fdd3060176d168f3307a66dc2432636ec7df616e81bed13753"
+      ],
+      "generated_tokens": [
+        378,
+        334,
+        313,
+        365,
+        332,
+        342
+      ],
+      "gpu_peak_mib": {
+        "0": 11323.0,
+        "1": 9549.0
+      },
+      "rss_peak_gib": 67.67063522338867,
+      "swap_peak_kib": 0
+    },
+    "concurrent-story-t12": {
+      "rates_tok_s": [
+        22.577402762659634,
+        25.482733267256783,
+        25.780560168604865,
+        26.324142326537824,
+        27.59519926901901,
+        27.038264933130645
+      ],
+      "warmed_mean_tok_s": 26.444179992909824,
+      "prompt_sha256": [
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "bcce9e6847e83f4fd053ce961a1873b49e8ac83c8770f49ce16630e592ee4fe1",
+        "ee968ff3aa2cf4fdd3060176d168f3307a66dc2432636ec7df616e81bed13753",
+        "76bb27709cc9d7d34a17358248c419a1641c3812d365fdc32b2a70a23c131acc",
+        "bcce9e6847e83f4fd053ce961a1873b49e8ac83c8770f49ce16630e592ee4fe1",
+        "ee968ff3aa2cf4fdd3060176d168f3307a66dc2432636ec7df616e81bed13753"
+      ],
+      "generated_tokens": [
+        378,
+        334,
+        313,
+        365,
+        332,
+        342
+      ],
+      "gpu_peak_mib": {
+        "0": 11263.0,
+        "1": 9551.0
+      },
+      "rss_peak_gib": 67.67026901245117,
+      "swap_peak_kib": 0
+    }
+  },
+  "gains_percent": {
+    "overlap_at_16_threads_vs_serial": 11.875268477692202,
+    "selected_fixed_vs_previous": 14.091072483340849,
+    "selected_story_vs_previous": 11.95922984190323,
+    "story_12_vs_16_threads": 1.3739563801540067
+  },
+  "limits": [
+    "Short 512-token prompts and 8K allocation; occupied 64K/128K not validated with this executor.",
+    "Twelve vs sixteen threads is a small local advantage, not a broad statistical guarantee.",
+    "No target quantization upgrade or speculative decoding.",
+    "Synthetic retrieval/story prompts are not a comprehensive quality evaluation."
+  ],
+  "overlap": {
+    "concurrent-v1": {
+      "cpu_ranges": 3968,
+      "cpu_ranges_overlapping_gpu_compute": 3706,
+      "cpu_expert_ms_per_step": 25.356710703125,
+      "cpu_gpu_compute_overlap_ms_per_step": 4.1920644609375,
+      "gpu_compute_union_ms_per_step": 14.5788354296875,
+      "definition": "Intersection of owned CPU expert NVTX ranges with actual CUDA graph/kernel intervals, excluding DMA-only overlap."
+    },
+    "concurrent-serial": {
+      "cpu_ranges": 3968,
+      "cpu_ranges_overlapping_gpu_compute": 0,
+      "cpu_expert_ms_per_step": 24.6479407109375,
+      "cpu_gpu_compute_overlap_ms_per_step": 0.0,
+      "gpu_compute_union_ms_per_step": 14.5913012734375,
+      "definition": "Intersection of owned CPU expert NVTX ranges with actual CUDA graph/kernel intervals, excluding DMA-only overlap."
+    }
+  },
+  "verification": {
+    "matched_fixed_variants_token_identical": true,
+    "matched_story_variants_token_identical": true,
+    "cpu_executor_bitwise_comparisons": 200,
+    "all_hit_mixed_all_miss_and_pending_destruction_tested": true,
+    "all_miss_real_model_smoke": "Paris",
+    "launcher_smoke": "Paris",
+    "earlier_unchanged_cpu_cuda_ffn_cases": 12,
+    "earlier_unchanged_cpu_cuda_matvec_cases": 55
+  }
+}
